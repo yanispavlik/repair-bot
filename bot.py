@@ -339,7 +339,28 @@ async def enter_phone(message: Message, state: FSMContext):
         reply_markup=main_menu
     )
     await state.clear()
+# --- Код для Render (веб-сервер) ---
+from flask import Flask, jsonify
+import threading
 
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Bot is running"
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok"})
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+flask_thread = threading.Thread(target=run_flask)
+flask_thread.daemon = True
+flask_thread.start()
+# --- Конец кода для Render ---
 async def main():
     init_db()
     print("Бот запущен.")
