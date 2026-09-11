@@ -1,4 +1,7 @@
 import asyncio
+import os
+import sqlite3
+from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -9,14 +12,41 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ==== ЗАПОЛНИ ЭТИ ДВЕ СТРОКИ ====
-import os
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))  # Узнаешь свой ID командой /myid в боте, потом впишешь сюда
-# =================================
+OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+DB = "orders.db"
+
+def init_db():
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT,
+        user_id INTEGER,
+        username TEXT,
+        name TEXT,
+        phone TEXT,
+        total REAL,
+        items TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_order(user_id, username, name, phone, total, items_text):
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO orders (created_at, user_id, username, name, phone, total, items) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (datetime.now().isoformat(timespec="seconds"), user_id, username, name, phone, total, items_text)
+    )
+    conn.commit()
+    conn.close()
 
 CATEGORIES = {
     "walls": {"name": "🧱 Стены", "works": [
@@ -107,6 +137,36 @@ async def start(message: Message, state: FSMContext):
 async def my_id(message: Message):
     await message.answer(f"Твой Telegram ID: {message.from_user.id}")
 
+@dp.message(Command("admin"))
+async def admin(message: Message):
+    if message.from_user.id != OWNER_ID:
+        await message.answer("Нет доступа.")
+        return
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("SELECT id, created_at, name, phone, total FROM orders ORDER BY id DESC LIMIT 10")
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        await message.answer("Заявок пока нет.")
+        return
+    text = "📊 Последние 10 заявок:\n\n"
+    for r in rows:
+        text += f"#{r[0]} | {r[1]}\n{r[2]} | {r[3]} | {r[4]} €\n\n"
+    await message.answer(text)
+
+@dp.message(Command("stats"))
+async def stats(message: Message):
+    if message.from_user.id != OWNER_ID:
+        await message.answer("Нет доступа.")
+        return
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*), COALESCE(SUM(total), 0) FROM orders")
+    count, total = cur.fetchone()
+    conn.close()
+    await message.answer(f"Всего заявок: {count}\nОбщая сумма: {total:.0f} €")
+
 @dp.message(F.text == "🧮 Рассчитать стоимость")
 async def start_calc(message: Message, state: FSMContext):
     await state.set_state(Calc.choosing_cat)
@@ -172,11 +232,9 @@ async def finish_selection(cb: CallbackQuery, state: FSMContext):
         for i in idxs:
             name, price, unit = CATEGORIES[cat_key]["works"][i]
             items.append({"name": name, "price": price, "unit": unit, "qty": None})
-
     if not items:
         await cb.answer("Ты ничего не выбрал!", show_alert=True)
         return
-
     await state.update_data(items=items, current_item=0)
     await state.set_state(Calc.entering_quantity)
     first = items[0]
@@ -193,14 +251,12 @@ async def enter_quantity(message: Message, state: FSMContext):
         if qty <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("Пожалуйста, напиши число больше нуля. Например: 25")
+        await message.answer("Пожалуйста, напиши число больше нуля.")
         return
-
     data = await state.get_data()
     items = data["items"]
     current = data["current_item"]
     items[current]["qty"] = qty
-
     next_idx = current + 1
     if next_idx < len(items):
         await state.update_data(items=items, current_item=next_idx)
@@ -220,7 +276,7 @@ async def enter_quantity(message: Message, state: FSMContext):
             [InlineKeyboardButton(text="✅ Оставить заявку", callback_data="confirm_yes")],
             [InlineKeyboardButton(text="❌ Не надо", callback_data="confirm_no")],
         ])
-        await state.update_data(items=items)
+        await state.update_data(items=items, total=total)
         await state.set_state(Calc.confirming)
         await message.answer(text, reply_markup=kb)
 
@@ -248,16 +304,27 @@ async def enter_phone(message: Message, state: FSMContext):
     items = data["items"]
     name = data["name"]
     phone = message.text
+    total = data["total"]
+
+    items_text = "; ".join(
+        f"{it['name']} {it['qty']}{it['unit']}×{it['price']}€" for it in items
+    )
+
+    save_order(
+        user_id=message.from_user.id,
+        username=message.from_user.username or "",
+        name=name,
+        phone=phone,
+        total=total,
+        items_text=items_text
+    )
 
     text = "🔔 Новая заявка!\n\n"
-    text += f"Имя: {name}\n"
-    text += f"Телефон: {phone}\n"
+    text += f"Имя: {name}\nТелефон: {phone}\n"
     text += f"Telegram: @{message.from_user.username or message.from_user.first_name}\n\n"
     text += "Смета:\n"
-    total = 0
     for it in items:
         s = it["price"] * it["qty"]
-        total += s
         text += f"• {it['name']}: {it['qty']} {it['unit']} × {it['price']} € = {s:.0f} €\n"
     text += f"\n💰 Итого: {total:.0f} €"
 
@@ -265,43 +332,19 @@ async def enter_phone(message: Message, state: FSMContext):
         try:
             await bot.send_message(OWNER_ID, text)
         except Exception as e:
-            print(f"Ошибка отправки владельцу: {e}")
+            print(f"Ошибка отправки: {e}")
 
     await message.answer(
-        "Спасибо! Заявка отправлена. Мастер свяжется с тобой в течение дня.",
+        "Спасибо! Заявка сохранена. Мастер свяжется с тобой в течение дня.",
         reply_markup=main_menu
     )
     await state.clear()
 
 async def main():
+    init_db()
     print("Бот запущен.")
     await dp.start_polling(bot)
-# --- Код для Render (веб-сервер) ---
-from flask import Flask, jsonify
-import os
-import threading
 
-# Этот блок нужен, чтобы Render видел, что сервис работает.
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    return "Bot is running"
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "ok"})
-
-def run_flask():
-    # Render сам назначает порт через переменную окружения PORT
-    port = int(os.environ.get("PORT", 8080))
-    # host='0.0.0.0' обязателен, чтобы сервер был доступен снаружи
-    app.run(host='0.0.0.0', port=port)
-
-# Запускаем Flask-сервер в отдельном потоке, чтобы он не мешал боту
-flask_thread = threading.Thread(target=run_flask)
-flask_thread.daemon = True
-flask_thread.start()
-# --- Конец кода для Render ---
 if __name__ == "__main__":
     asyncio.run(main())
+
